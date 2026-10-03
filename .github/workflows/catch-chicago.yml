@@ -125,7 +125,9 @@ jobs:
           import json, os, urllib.request, datetime
           rk = "chicago"
           prev = {}
-          try: prev = json.load(open("/tmp/prev.json")).get(rk) or {}
+          try:
+              rq = urllib.request.Request("https://hunter.wanli.uk/api/status", headers={"User-Agent": "a1-hunter/1.0"})
+              prev = json.loads(urllib.request.urlopen(rq, timeout=20).read().decode()).get(rk) or {}
           except Exception: pass
           hist = (prev.get("history") or [])[-199:]
           ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
