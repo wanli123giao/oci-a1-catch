@@ -1,0 +1,161 @@
+name: catch-chicago
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+    - cron: "2-59/7 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+  issues: write
+  contents: read
+
+concurrency:
+  group: catch-chicago
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_SHA: ea70acaf92bedcf0900a9209bdd8c31106b0df83
+  REGION_KEY: chicago
+
+jobs:
+  catch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    steps:
+      - name: Fetch upstream (pinned)
+        run: |
+          curl -sL "https://github.com/hitrov/oci-arm-host-capacity/archive/${UPSTREAM_SHA}.tar.gz" | tar xz --strip-components=1
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress --quiet
+      - name: Run catcher
+        id: run
+        env:
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_USER_ID: ${{ secrets.OCI_USER_ID }}
+          OCI_TENANCY_ID: ${{ secrets.OCI_TENANCY_ID }}
+          OCI_KEY_FINGERPRINT: ${{ secrets.OCI_KEY_FINGERPRINT }}
+          OCI_PRIVATE_KEY_FILENAME: ${{ secrets.OCI_PRIVATE_KEY_URL }}
+          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          OCI_IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
+          OCI_OCPUS: ${{ secrets.OCI_OCPUS }}
+          OCI_MEMORY_IN_GBS: ${{ secrets.OCI_MEMORY_IN_GBS }}
+          OCI_SHAPE: ${{ secrets.OCI_SHAPE }}
+          OCI_MAX_INSTANCES: ${{ secrets.OCI_MAX_INSTANCES }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+          OCI_BOOT_VOLUME_SIZE_IN_GBS: ${{ secrets.OCI_BOOT_VOLUME_SIZE_IN_GBS }}
+          OCI_AVAILABILITY_DOMAIN: ""
+          CACHE_AVAILABILITY_DOMAINS: "1"
+        run: |
+          set +e
+          php index.php > /tmp/catch.log 2>&1
+          tail -c 2500 /tmp/catch.log
+          if grep -q 'ocid1\.instance\.' /tmp/catch.log; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+            grep -oE 'ocid1\.instance\.[a-z0-9.]+' /tmp/catch.log | head -1 > /tmp/iid
+          else
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+          fi
+          if grep -q 'TooManyRequests' /tmp/catch.log; then echo "err=429" >> "$GITHUB_OUTPUT"
+          elif grep -q 'Out of host capacity' /tmp/catch.log; then echo "err=capacity" >> "$GITHUB_OUTPUT"
+          else echo "err=unknown" >> "$GITHUB_OUTPUT"; fi
+          exit 0
+      - name: Push status
+        if: always()
+        env:
+          STATUS_DEPLOY_KEY: ${{ secrets.STATUS_DEPLOY_KEY }}
+          REGION_KEY: chicago
+          RESULT: ${{ steps.run.outputs.result }}
+          ERR: ${{ steps.run.outputs.err }}
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$STATUS_DEPLOY_KEY" > ~/.ssh/st
+          chmod 600 ~/.ssh/st
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/st -o StrictHostKeyChecking=accept-new"
+          git clone -q git@github.com:wanli123giao/a1-hunter-status.git /tmp/st
+          cd /tmp/st
+          mkdir -p status
+          tail -c 3000 /tmp/catch.log > "status/lastlog-${REGION_KEY}.txt"
+          python3 - <<'PYEOF'
+          import json, os, datetime
+          rk = os.environ["REGION_KEY"]
+          p = f"status/{rk}.json"
+          try:
+              d = json.load(open(p))
+          except Exception:
+              d = {"region_key": rk, "history": []}
+          entry = {
+              "ts": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+              "result": os.environ.get("RESULT") or "fail",
+              "err": os.environ.get("ERR") or "unknown",
+              "run_id": os.environ.get("RUN_ID") or "",
+          }
+          d["history"] = (d.get("history") or [])[-199:] + [entry]
+          d.update({
+              "region_key": rk,
+              "updated": entry["ts"],
+              "result": entry["result"],
+              "err": entry["err"],
+              "attempts": len(d["history"]),
+          })
+          if entry["result"] == "success":
+              try:
+                  d["success"] = {"iid": open("/tmp/iid").read().strip(), "ts": entry["ts"]}
+              except Exception:
+                  d["success"] = {"iid": "", "ts": entry["ts"]}
+          json.dump(d, open(p, "w"), indent=1)
+          PYEOF
+          git config user.email "hunter@wanli.uk"
+          git config user.name "a1-hunter"
+          git add -A
+          git commit -qm "${REGION_KEY} ${RESULT:-never} ${ERR:-}" || true
+          git push -q origin HEAD:main
+      - name: Send success email
+        if: steps.run.outputs.result == 'success'
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+          REGION_KEY: chicago
+        run: |
+          if [ -z "$SMTP_HOST" ] || [ -z "$SMTP_USER" ] || [ -z "$SMTP_PASS" ]; then
+            echo "SMTP secrets not set - skipping email"
+            exit 0
+          fi
+          python3 - <<'PYEOF'
+          import os, smtplib
+          from email.mime.text import MIMEText
+          iid = open("/tmp/iid").read().strip() if os.path.exists("/tmp/iid") else ""
+          msg = MIMEText(f"A1 instance CREATED in {os.environ['REGION_KEY']}!\n\nInstance OCID: {iid}\nDashboard: https://hunter.wanli.uk\n\nThis workflow has been self-disabled.", "plain", "utf-8")
+          msg["Subject"] = "[a1-hunter] %s instance CREATED" % os.environ["REGION_KEY"]
+          msg["From"] = os.environ["SMTP_USER"]
+          msg["To"] = os.environ["SMTP_TO"]
+          s = smtplib.SMTP(os.environ["SMTP_HOST"], int(os.environ.get("SMTP_PORT", "465")), timeout=30)
+          s.starttls()
+          s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
+          s.sendmail(msg["From"], [msg["To"]], msg.as_string())
+          s.quit()
+          print("email sent")
+          PYEOF
+      - name: Issue fallback notification
+        if: steps.run.outputs.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh issue create -R "$GITHUB_REPOSITORY" \
+            --title "[SUCCESS] ${REGION_KEY} instance created" \
+            --body "Instance launched. Dashboard: https://hunter.wanli.uk — workflow self-disabled." || true
+      - name: Disable schedule on success
+        if: steps.run.outputs.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=== INSTANCE CREATED — disabling this workflow ==="
+          gh workflow disable "catch-chicago.yml" -R "$GITHUB_REPOSITORY" || true
