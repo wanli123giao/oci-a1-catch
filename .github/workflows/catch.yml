@@ -1,0 +1,59 @@
+name: oci-a1-catch
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+    - cron: "2-59/7 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+
+env:
+  UPSTREAM_SHA: ea70acaf92bedcf0900a9209bdd8c31106b0df83
+
+jobs:
+  catch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    steps:
+      - name: Fetch upstream (pinned)
+        run: |
+          curl -sL "https://github.com/hitrov/oci-arm-host-capacity/archive/${UPSTREAM_SHA}.tar.gz" | tar xz --strip-components=1
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress --quiet
+      - name: Run catcher
+        id: run
+        env:
+          OCI_REGION: ${{ secrets.OCI_REGION }}
+          OCI_USER_ID: ${{ secrets.OCI_USER_ID }}
+          OCI_TENANCY_ID: ${{ secrets.OCI_TENANCY_ID }}
+          OCI_KEY_FINGERPRINT: ${{ secrets.OCI_KEY_FINGERPRINT }}
+          OCI_PRIVATE_KEY_FILENAME: ${{ secrets.OCI_PRIVATE_KEY_URL }}
+          OCI_SUBNET_ID: ${{ secrets.OCI_SUBNET_ID }}
+          OCI_IMAGE_ID: ${{ secrets.OCI_IMAGE_ID }}
+          OCI_OCPUS: ${{ secrets.OCI_OCPUS }}
+          OCI_MEMORY_IN_GBS: ${{ secrets.OCI_MEMORY_IN_GBS }}
+          OCI_SHAPE: ${{ secrets.OCI_SHAPE }}
+          OCI_MAX_INSTANCES: ${{ secrets.OCI_MAX_INSTANCES }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.OCI_SSH_PUBLIC_KEY }}
+          OCI_BOOT_VOLUME_SIZE_IN_GBS: ${{ secrets.OCI_BOOT_VOLUME_SIZE_IN_GBS }}
+          OCI_AVAILABILITY_DOMAIN: ""
+          CACHE_AVAILABILITY_DOMAINS: "1"
+        run: |
+          set +e
+          php index.php > /tmp/catch.log 2>&1
+          code=$?
+          tail -c 2500 /tmp/catch.log
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          exit 0
+      - name: Disable schedule on success
+        if: steps.run.outputs.exit == '0'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "=== INSTANCE CREATED — disabling this workflow ==="
+          gh workflow disable "catch.yml" -R "$GITHUB_REPOSITORY" || true
