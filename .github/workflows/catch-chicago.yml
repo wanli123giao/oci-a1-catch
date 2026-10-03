@@ -68,7 +68,7 @@ jobs:
             echo "result=fail" >> "$GITHUB_OUTPUT"
           fi
           if grep -q 'TooManyRequests' /tmp/catch.log; then echo "err=429" >> "$GITHUB_OUTPUT"
-          elif grep -q 'ServiceError' /tmp/catch.log; then echo "err=capacity" >> "$GITHUB_OUTPUT"
+          elif grep -qE 'ServiceError|Out of host capacity|InternalError' /tmp/catch.log; then echo "err=capacity" >> "$GITHUB_OUTPUT"
           else echo "err=unknown" >> "$GITHUB_OUTPUT"; fi
           exit 0
       - name: Fetch public IP on success
