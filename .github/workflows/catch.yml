@@ -48,7 +48,11 @@ jobs:
           php index.php > /tmp/catch.log 2>&1
           code=$?
           tail -c 2500 /tmp/catch.log
-          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          if grep -q 'ocid1\.instance\.' /tmp/catch.log; then
+            echo "exit=0" >> "$GITHUB_OUTPUT"
+          else
+            echo "exit=1" >> "$GITHUB_OUTPUT"
+          fi
           exit 0
       - name: Disable schedule on success
         if: steps.run.outputs.exit == '0'
