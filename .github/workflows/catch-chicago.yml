@@ -139,7 +139,7 @@ jobs:
           payload = json.dumps({"region_key": rk, "status": d, "heartbeat": ts,
                                 "log": open("/tmp/catch.log").read()[-2500:] if os.path.exists("/tmp/catch.log") else ""}).encode()
           req = urllib.request.Request("https://hunter.wanli.uk/api/put?token=" + os.environ["PUT_TOKEN"],
-                                       data=payload, headers={"Content-Type": "application/json"}, method="POST")
+                                       data=payload, headers={"Content-Type": "application/json", "User-Agent": "a1-hunter/1.0"}, method="POST")
           print(urllib.request.urlopen(req, timeout=25).read().decode()[:120])
           PYEOF
       - name: Disable on success
