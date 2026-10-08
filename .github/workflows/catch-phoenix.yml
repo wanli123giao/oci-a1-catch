@@ -133,7 +133,7 @@ jobs:
           result = os.environ.get("RESULT") or "fail"
           hist.append({"ts": ts, "result": result, "err": os.environ.get("ERR") or "", "run_id": "gh"})
           d = {"region_key": rk, "updated": ts, "result": result, "err": (os.environ.get("ERR") if result != "success" else None),
-               "attempts": len(hist), "source": "github", "history": hist}
+               "attempts": (prev.get("attempts") or 0) + 1, "source": "github", "history": hist}
           if result == "success":
               iid = open("/tmp/iid").read().strip() if os.path.exists("/tmp/iid") else ""
               d["success"] = {"iid": iid, "ts": ts, "ip": os.environ.get("IP") or ""}
