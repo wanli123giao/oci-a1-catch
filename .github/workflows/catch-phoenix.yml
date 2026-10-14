@@ -1,0 +1,150 @@
+name: catch-phoenix
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch: {}
+
+permissions:
+  actions: write
+
+concurrency:
+  group: catch-phoenix
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_SHA: ea70acaf92bedcf0900a9209bdd8c31106b0df83
+  REGION_KEY: phoenix
+
+jobs:
+  catch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 14
+    steps:
+      - name: Fetch upstream (pinned)
+        run: |
+          curl -sL "https://github.com/hitrov/oci-arm-host-capacity/archive/${UPSTREAM_SHA}.tar.gz" | tar xz --strip-components=1
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+      - name: Install dependencies
+        run: composer install --no-interaction --no-progress --quiet
+      - name: Materialize API key
+        env:
+          K: ${{ secrets.B_KEY }}
+        run: |
+          printf '%s' "$K" > /tmp/oci_key.pem
+          chmod 600 /tmp/oci_key.pem
+          [ "$(head -c 27 /tmp/oci_key.pem)" = "-----BEGIN PRIVATE KEY-----" ]
+      - name: Read current status
+        run: |
+          curl -s --max-time 20 "https://hunter.wanli.uk/api/status" -o /tmp/prev.json || echo '{"chicago":null,"phoenix":null}' > /tmp/prev.json
+      - name: Run catcher
+        id: run
+        env:
+          OCI_REGION: ${{ secrets.B_OCI_REGION }}
+          OCI_USER_ID: ${{ secrets.B_OCI_USER_ID }}
+          OCI_TENANCY_ID: ${{ secrets.B_OCI_TENANCY_ID }}
+          OCI_KEY_FINGERPRINT: ${{ secrets.B_OCI_KEY_FINGERPRINT }}
+          OCI_PRIVATE_KEY_FILENAME: /tmp/oci_key.pem
+          OCI_SUBNET_ID: ${{ secrets.B_OCI_SUBNET_ID }}
+          OCI_IMAGE_ID: ${{ secrets.B_OCI_IMAGE_ID }}
+          OCI_OCPUS: ${{ secrets.B_OCI_OCPUS }}
+          OCI_MEMORY_IN_GBS: ${{ secrets.B_OCI_MEMORY_IN_GBS }}
+          OCI_SHAPE: ${{ secrets.B_OCI_SHAPE }}
+          OCI_MAX_INSTANCES: ${{ secrets.B_OCI_MAX_INSTANCES }}
+          OCI_SSH_PUBLIC_KEY: ${{ secrets.B_OCI_SSH_PUBLIC_KEY }}
+          OCI_BOOT_VOLUME_SIZE_IN_GBS: ${{ secrets.B_OCI_BOOT_VOLUME_SIZE_IN_GBS }}
+          OCI_AVAILABILITY_DOMAIN: ""
+          CACHE_AVAILABILITY_DOMAINS: "1"
+        run: |
+          set +e
+          php index.php > /tmp/catch.log 2>&1
+          if grep -q 'ocid1\.instance\.' /tmp/catch.log; then
+            echo "result=success" >> "$GITHUB_OUTPUT"
+            grep -oE 'ocid1\.instance\.[a-z0-9.]+' /tmp/catch.log | head -1 > /tmp/iid
+          else
+            echo "result=fail" >> "$GITHUB_OUTPUT"
+          fi
+          if grep -q 'TooManyRequests' /tmp/catch.log; then echo "err=429" >> "$GITHUB_OUTPUT"
+          elif grep -qE 'ServiceError|Out of host capacity|InternalError' /tmp/catch.log; then echo "err=capacity" >> "$GITHUB_OUTPUT"
+          else echo "err=unknown" >> "$GITHUB_OUTPUT"; fi
+          exit 0
+      - name: Fetch public IP on success
+        if: steps.run.outputs.result == 'success'
+        env:
+          OCI_CLI_AUTH: api_key
+          OCI_CLI_USER: ${{ secrets.B_OCI_USER_ID }}
+          OCI_CLI_TENANCY: ${{ secrets.B_OCI_TENANCY_ID }}
+          OCI_CLI_FINGERPRINT: ${{ secrets.B_OCI_KEY_FINGERPRINT }}
+          OCI_CLI_KEY_CONTENT: ${{ secrets.B_KEY }}
+          OCI_CLI_REGION: ${{ secrets.B_OCI_REGION }}
+        run: |
+          pip3 install -q oci-cli 2>/dev/null || true
+          IID=$(cat /tmp/iid)
+          for i in 1 2 3 4 5 6 7 8; do
+            sleep 12
+            IP=$(timeout 40 oci compute instance list-vnics --instance-id "$IID" --query 'data[0]."public-ip"' --raw-output 2>/dev/null || true)
+            case "$IP" in *.*[0-9]) echo "$IP" > /tmp/ip; break;; esac
+          done
+          [ -f /tmp/ip ] && echo "ip=$(cat /tmp/ip)" >> "$GITHUB_OUTPUT" || echo "ip=" >> "$GITHUB_OUTPUT"
+      - name: Send success email
+        if: steps.run.outputs.result == 'success'
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          SMTP_TO: ${{ secrets.SMTP_TO }}
+          IP_NOW: ${{ steps.run.outputs.ip }}
+        run: |
+          python3 - <<'PYEOF'
+          import os, smtplib, ssl
+          from email.mime.text import MIMEText
+          iid = open("/tmp/iid").read().strip() if os.path.exists("/tmp/iid") else ""
+          ip = os.environ.get("IP_NOW", "")
+          msg = MIMEText(f"A1 instance CREATED (phoenix)!\n\nOCID: {iid}\nIP: {ip}\nDashboard: https://hunter.wanli.uk\n\nssh -i ~/.ssh/oci_chi_a1 ubuntu@{ip}", "plain", "utf-8")
+          msg["Subject"] = "[a1-hunter] phoenix 中签！"
+          msg["From"] = os.environ["SMTP_USER"]; msg["To"] = os.environ["SMTP_TO"]
+          with smtplib.SMTP_SSL(os.environ["SMTP_HOST"], int(os.environ["SMTP_PORT"]), timeout=30, context=ssl.create_default_context()) as s:
+              s.login(os.environ["SMTP_USER"], os.environ["SMTP_PASS"])
+              s.sendmail(msg["From"], [msg["To"]], msg.as_string())
+          print("mail sent")
+          PYEOF
+        # IP 传入
+      - name: Push status + heartbeat
+        if: always()
+        env:
+          PUT_TOKEN: ${{ secrets.PUT_TOKEN }}
+          RESULT: ${{ steps.run.outputs.result }}
+          ERR: ${{ steps.run.outputs.err }}
+          IP: ${{ steps.run.outputs.ip }}
+        run: |
+          python3 - <<'PYEOF'
+          import json, os, urllib.request, datetime
+          rk = "phoenix"
+          prev = {}
+          try:
+              rq = urllib.request.Request("https://hunter.wanli.uk/api/status", headers={"User-Agent": "a1-hunter/1.0"})
+              prev = json.loads(urllib.request.urlopen(rq, timeout=20).read().decode()).get(rk) or {}
+          except Exception: pass
+          hist = (prev.get("history") or [])[-199:]
+          ts = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          result = os.environ.get("RESULT") or "fail"
+          hist.append({"ts": ts, "result": result, "err": os.environ.get("ERR") or "", "run_id": "gh"})
+          d = {"region_key": rk, "updated": ts, "result": result, "err": (os.environ.get("ERR") if result != "success" else None),
+               "attempts": (prev.get("attempts") or 0) + 1, "source": "github", "history": hist}
+          if result == "success":
+              iid = open("/tmp/iid").read().strip() if os.path.exists("/tmp/iid") else ""
+              d["success"] = {"iid": iid, "ts": ts, "ip": os.environ.get("IP") or ""}
+          payload = json.dumps({"region_key": rk, "status": d, "heartbeat": ts,
+                                "log": open("/tmp/catch.log").read()[-2500:] if os.path.exists("/tmp/catch.log") else ""}).encode()
+          req = urllib.request.Request("https://hunter.wanli.uk/api/put?token=" + os.environ["PUT_TOKEN"],
+                                       data=payload, headers={"Content-Type": "application/json", "User-Agent": "a1-hunter/1.0"}, method="POST")
+          print(urllib.request.urlopen(req, timeout=25).read().decode()[:120])
+          PYEOF
+      - name: Disable on success
+        if: steps.run.outputs.result == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow disable "catch-phoenix.yml" -R "$GITHUB_REPOSITORY" || true
