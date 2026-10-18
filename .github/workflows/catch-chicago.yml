@@ -22,7 +22,7 @@ jobs:
           HUNTER_ADMIN_TOKEN: ${{ secrets.HUNTER_ADMIN_TOKEN }}
         run: |
           python3 - <<'PYEOF'
-          import json, os, urllib.request
+          import json, os, urllib.request, urllib.error
           base = "https://hunter.wanli.uk/api"
           headers = {"User-Agent": "Mozilla/5.0 a1-hunter-watchdog/3", "Content-Type": "application/json"}
           req = urllib.request.Request(base + "/status", headers=headers)
@@ -38,7 +38,12 @@ jobs:
               headers["Authorization"] = "Bearer " + os.environ["HUNTER_ADMIN_TOKEN"]
               data = json.dumps({"action": "wake", "region": "chicago"}).encode()
               req = urllib.request.Request(base + "/control", data=data, headers=headers)
-              with urllib.request.urlopen(req, timeout=30) as response:
-                  result = json.load(response)
-              print("Cloud scheduler healthy. Next attempt:", result.get("next_attempt_at"))
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as response:
+                      result = json.load(response)
+                  print("Cloud scheduler healthy. Next attempt:", result.get("next_attempt_at"))
+              except urllib.error.HTTPError as error:
+                  if error.code != 409:
+                      raise
+                  print("Account is executing; no duplicate wake needed.")
           PYEOF
